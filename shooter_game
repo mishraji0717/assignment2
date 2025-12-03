@@ -1,0 +1,325 @@
+/* game.c
+   Windows console runner game with:
+   - score, lives, difficulty
+   - multiple obstacles
+   - menu, restart, highscore file
+   - sound (winmm)
+   Compile on Windows: gcc game.c -o RunnerGame.exe -lwinmm
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <conio.h>
+#include <windows.h>
+#include <mmsystem.h>
+
+#pragma comment(lib, "winmm.lib")  // for MSVC; MinGW still needs -lwinmm flag
+
+/* ---------- CONFIG ---------- */
+#define LANES 3
+#define SCREEN_ROWS 10     // vertical rows for obstacles before player row
+#define MAX_OBS 3          // number of simultaneous obstacles
+#define INITIAL_SPEED 150  // initial sleep in ms (lower -> faster)
+#define SPEED_STEP 10      // ms decrease per level step
+#define SCORE_PER_LEVEL 10 // points needed to increase difficulty
+#define INITIAL_LIVES 3
+
+/* ---------- ICONS (ascii) ---------- */
+const char *PLAYER_ICON = "<^>";   // width 3
+const char *OBSTACLE_ICON = "[@]"; // width 3
+const char *BULLET_ICON = " | ";   // width 3 (rendered centered in lane)
+const char *EMPTY_LANE = "   ";
+
+/* ---------- Globals ---------- */
+int highScore = 0;
+
+/* ---------- Utility: sound wrapper ---------- */
+void play_sound(const char *file, DWORD flags) {
+    if (!file) return;
+    PlaySoundA(file, NULL, flags);
+}
+
+/* ---------- Console helpers ---------- */
+void clear_screen_fast() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD pos = {0, 0};
+    SetConsoleCursorPosition(h, pos);
+}
+
+void hide_cursor() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hOut, &cursorInfo);
+    cursorInfo.bVisible = FALSE;
+    SetConsoleCursorInfo(hOut, &cursorInfo);
+}
+
+void show_cursor() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hOut, &cursorInfo);
+    cursorInfo.bVisible = TRUE;
+    SetConsoleCursorInfo(hOut, &cursorInfo);
+}
+
+/* ---------- Highscore file handling ---------- */
+void load_highscore(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { highScore = 0; return; }
+    fscanf(f, "%d", &highScore);
+    fclose(f);
+}
+
+void save_highscore(const char *path, int score) {
+    if (score <= highScore) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%d", score);
+    fclose(f);
+    highScore = score;
+}
+
+/* ---------- Menu / instructions ---------- */
+int show_menu() {
+    while (1) {
+        system("cls");
+        printf("=====================================\n");
+        printf("        CONSOLE RUNNER GAME\n");
+        printf("=====================================\n");
+        printf("High Score: %d\n\n", highScore);
+        printf("1. Start Game\n");
+        printf("2. Instructions\n");
+        printf("3. Exit\n\n");
+        printf("Choose (1/2/3): ");
+
+        int ch = getch();
+        if (ch == '1') return 1;
+        if (ch == '2') {
+            system("cls");
+            printf("INSTRUCTIONS\n");
+            printf("Left  Arrow : Move Left\n");
+            printf("Right Arrow : Move Right\n");
+            printf("Space       : Shoot (one bullet at a time)\n");
+            printf("P           : Pause/unpause\n");
+            printf("Q           : Quit to menu\n\n");
+            printf("Avoid obstacles and shoot them for extra points.\n");
+            printf("Press any key to return to menu...");
+            getch();
+        }
+        if (ch == '3') return 0;
+    }
+}
+
+/* ---------- Main game routine ---------- */
+void run_game() {
+    int score = 0;
+    int lives = INITIAL_LIVES;
+    int speed = INITIAL_SPEED;
+
+    // Obstacles
+    int obsLane[MAX_OBS];
+    int obsStep[MAX_OBS];
+    int obsActive[MAX_OBS];
+
+    // Bullet (single)
+    int bulletLane = -1;
+    int bulletStep = -1; // -1 -> no bullet active
+
+    // Player lane (0..LANES-1)
+    int playerLane = 1;
+
+    // Initialize
+    for (int i = 0; i < MAX_OBS; i++) {
+        obsActive[i] = 1;
+        obsLane[i] = rand() % LANES;
+        obsStep[i] = -(rand() % SCREEN_ROWS); // stagger start (can be negative so they enter later)
+    }
+
+    // Play background music
+    play_sound("bg.wav", SND_ASYNC | SND_LOOP);
+
+    hide_cursor();
+    int paused = 0;
+
+    // Game loop
+    while (1) {
+        // INPUT handling (non-blocking)
+        if (_kbhit()) {
+            int ch = getch();
+            if (ch==0 || ch==224) { // arrow or special
+                ch = getch(); // get actual code
+                if (ch == 75 && playerLane > 0) playerLane--;    // left
+                if (ch == 77 && playerLane < LANES-1) playerLane++; // right
+            } else {
+                if (ch == ' ' || ch == 32) { // space - shoot
+                    if (bulletStep == -1) { // only one bullet at a time
+                        bulletLane = playerLane;
+                        bulletStep = SCREEN_ROWS; // starts from player row index
+                        play_sound("laser.wav", SND_ASYNC);
+                    }
+                } else if (ch == 'p' || ch == 'P') { // pause
+                    paused = !paused;
+                    if (paused) {
+                        play_sound(NULL, 0); // stop SND_ASYNC sounds (not background loop)
+                    } else {
+                        play_sound("bg.wav", SND_ASYNC | SND_LOOP);
+                    }
+                } else if (ch == 'q' || ch == 'Q') {
+                    // stop background
+                    play_sound(NULL, 0);
+                    break; // quit to menu
+                }
+            }
+        }
+
+        if (!paused) {
+            // MOVE bullets upward
+            if (bulletStep >= 0) {
+                bulletStep--;
+                if (bulletStep < 0) {
+                    bulletStep = -1; // deactivate bullet once it leaves screen
+                }
+            }
+
+            // Move obstacles down
+            for (int i = 0; i < MAX_OBS; i++) {
+                if (!obsActive[i]) continue;
+                obsStep[i]++;
+
+                // If obstacle reached player's row (row index SCREEN_ROWS)
+                if (obsStep[i] == SCREEN_ROWS) {
+                    // If same lane -> collision
+                    if (obsLane[i] == playerLane) {
+                        lives--;
+                        play_sound("impact.wav", SND_ASYNC);
+                        // reset this obstacle
+                        obsStep[i] = -(rand() % SCREEN_ROWS) - 2;
+                        obsLane[i] = rand() % LANES;
+                        if (lives <= 0) {
+                            // stop background, play explosion or impact, show gameover
+                            play_sound(NULL, 0);
+                            play_sound("impact.wav", SND_ASYNC);
+                            Sleep(600);
+                            clear_screen_fast();
+                            printf("\n\n   ======= GAME OVER =======\n");
+                            printf("   Score: %d\n", score);
+                            printf("   Lives: 0\n");
+                            if (score > highScore) {
+                                printf("   New High Score! (%d -> %d)\n", highScore, score);
+                                save_highscore("highscore.txt", score);
+                            } else {
+                                printf("   High Score: %d\n", highScore);
+                            }
+                            printf("\n   Press any key to continue...");
+                            getch();
+                            show_cursor();
+                            return;
+                        }
+                    } else {
+                        // obstacle passed safely -> increase score
+                        score++;
+                        // Level up check
+                        if ((score % SCORE_PER_LEVEL) == 0) {
+                            int newSpeed = INITIAL_SPEED - (score / SCORE_PER_LEVEL) * SPEED_STEP;
+                            if (newSpeed < 40) newSpeed = 40;
+                            if (newSpeed != speed) {
+                                speed = newSpeed;
+                                play_sound("levelup.wav", SND_ASYNC);
+                            }
+                        }
+                        // reset obstacle to start again
+                        obsStep[i] = -(rand() % SCREEN_ROWS) - 2;
+                        obsLane[i] = rand() % LANES;
+                    }
+                }
+            }
+
+            // Bullet collision with obstacles
+            if (bulletStep >= 0) {
+                for (int i = 0; i < MAX_OBS; i++) {
+                    if (!obsActive[i]) continue;
+                    if (obsStep[i] == bulletStep && obsLane[i] == bulletLane) {
+                        // destroy obstacle
+                        score += 2; // bonus for shooting
+                        play_sound("explosion.wav", SND_ASYNC);
+                        // reset obstacle
+                        obsStep[i] = -(rand() % SCREEN_ROWS) - 2;
+                        obsLane[i] = rand() % LANES;
+                        // deactivate bullet
+                        bulletStep = -1;
+                        break;
+                    }
+                }
+            }
+        } // end paused
+
+        // DRAW
+        clear_screen_fast();
+
+        // Top border
+        printf("=====================================\n");
+        printf("Lives: %d   Score: %d   High: %d   Speed(ms): %d\n", lives, score, highScore, speed);
+        printf("=====================================\n");
+
+        // For each row, print lanes
+        for (int row = 0; row < SCREEN_ROWS; row++) {
+            // Create string for each lane
+            char laneStr[LANES][8];
+            for (int l = 0; l < LANES; l++) sprintf(laneStr[l], "%s", EMPTY_LANE);
+
+            // Place obstacles if their step equals this row
+            for (int i = 0; i < MAX_OBS; i++) {
+                if (!obsActive[i]) continue;
+                if (obsStep[i] == row) {
+                    sprintf(laneStr[obsLane[i]], "%s", OBSTACLE_ICON);
+                }
+            }
+
+            // Place bullet if its step equals this row
+            if (bulletStep == row) {
+                sprintf(laneStr[bulletLane], "%s", BULLET_ICON);
+            }
+
+            // Print row: vertical bars and lane contents
+            printf("| %s | %s | %s |\n", laneStr[0], laneStr[1], laneStr[2]);
+        }
+
+        // Player row
+        // prepare lanes with player
+        char pl[LANES][8];
+        for (int l = 0; l < LANES; l++) sprintf(pl[l], "%s", EMPTY_LANE);
+        sprintf(pl[playerLane], "%s", PLAYER_ICON);
+
+        printf("=====================================\n");
+        printf("| %s | %s | %s |\n", pl[0], pl[1], pl[2]);
+        printf("=====================================\n");
+
+        // small delay
+        Sleep(speed);
+    } // end game loop
+
+    // stop background when quitting to menu
+    play_sound(NULL, 0);
+    show_cursor();
+}
+
+/* ---------- main ---------- */
+int main() {
+    srand((unsigned)time(NULL));
+    load_highscore("highscore.txt");
+
+    while (1) {
+        int opt = show_menu();
+        if (!opt) break; // exit
+        run_game();
+
+        // When run_game returns, ask to play again or go to menu (we return to menu)
+        // highscore is updated inside run_game on game end; ensure it's saved if changed
+        // saving is done when game ends if beaten
+    }
+
+    printf("\nThanks for playing! Press any key to exit...");
+    getch();
+    return 0;
+}
